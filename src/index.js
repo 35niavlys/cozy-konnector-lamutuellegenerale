@@ -12,271 +12,291 @@ const {
 } = require('cozy-konnector-libs')
 const request = requestFactory({
   //  debug: true,
-  cheerio: true,
+  cheerio: false,
   json: false,
   jar: true
 })
+const crypto = require('crypto')
+const stream = require('stream')
+const cheerio = require('cheerio')
 
-const baseUrl = 'https://mon-espace-adherent.lamutuellegenerale.fr'
+const BASE_URL = 'https://api.lamutuellegenerale.fr'
+const API_KEY = 'l7xx7e96b9de59df491a8d4c79be999e7c87'
+const OIDC_CLIENT_ID = '066e0672-4b28-422d-aa44-ef42d0aad64a'
 
 module.exports = new BaseKonnector(start)
 
 async function start(fields) {
   log('info', 'Authenticating ...')
-  await authenticate(fields.login, fields.password)
+  const token = await authenticate(fields.login, fields.password)
+  token.golden_id = JSON.parse(atob(token.id_token.split('.')[1])).sub[0].id
   log('info', 'Successfully logged in')
-
-  const identity = await getIdentity()
+  log('debug', token, 'Token')
+  const identity = await getIdentity(token)
   await this.saveIdentity(identity, fields.login)
 
-  log('info', 'Fetching the list of documents')
-  const $ = await request(
-    `${baseUrl}/EspaceAdherentWebApp/MesDecomptes/Accueil`
-  )
+  // log('info', 'Fetching the list of refunds')
+  // const $ = await request(`${BASE_URL}/espaceadherent/V1/mesremboursements/`, {
+  //   json: true,
+  //   headers: {
+  //     'api-key': API_KEY,
+  //     Authorization: `${token.token_type} ${token.access_token}`,
+  //     idPersonneUtilisateur: token.golden_id,
+  //     appRequestCode: 'EspaceAdherent'
+  //   }
+  // })
 
-  log('info', 'Parsing list of bills')
-  const documents = await parseBills($)
+  // log('info', $)
 
-  log('info', 'Saving data to Cozy')
+  const bill = {
+    // fileurl: `${BASE_URL}/espaceadherent/V1/mesremboursements/edition?debutPeriode=2021-04-01&finPeriode=2021-04-30&tri=DATE_PAIEMENT&mock=false`,
+    fetchFile: async function(d) {
+      // filestream: async function(d) {
+      log('info', 'Fetching file for id: ' + d.id)
+      // Prepare the store to fetch the next bill
+      return request(
+        `${BASE_URL}/espaceadherent/V1/mesremboursements/edition?debutPeriode=2021-04-01&finPeriode=2021-04-30&tri=DATE_PAIEMENT&mock=false`,
+        {
+          json: true,
+          form: {
+            debutPeriode: '2021-04-01',
+            finPeriode: '2021-04-30',
+            tri: 'DATE_PAIEMENT',
+            mock: 'false'
+          },
+          headers: {
+            'api-key': API_KEY,
+            Authorization: `${token.token_type} ${token.access_token}`,
+            idPersonneUtilisateur: token.golden_id,
+            appRequestCode: 'EspaceAdherent'
+          }
+        }
+      ).then(e => Buffer.from(e.edition, 'base64').toString('binary'))
+      // .pipe(new stream.PassThrough())
+    },
+    // beneficiary,
+    date: new Date(),
+    // isThirdPartyPayer,
+    groupAmount: 10,
+    // originalDate: parseDate(originalDate),
+    // subtype,
+    // originalAmount,
+    // socialSecurityRefund,
+    amount: 10,
+    filename: 'test.pdf',
+    vendor: 'lamutuellegenerale',
+    type: 'health_costs',
+    currency: '€',
+    isRefund: true,
+    metadata: {
+      importDate: new Date(),
+      version: 1
+    },
+    requestOptions: {
+      form: {
+        debutPeriode: '2021-04-01',
+        finPeriode: '2021-04-30',
+        tri: 'DATE_PAIEMENT',
+        mock: 'false'
+      },
+      headers: {
+        'api-key': API_KEY,
+        Authorization: `${token.token_type} ${token.access_token}`,
+        idPersonneUtilisateur: token.golden_id,
+        appRequestCode: 'EspaceAdherent'
+      }
+    }
+  }
+
+  const documents = [bill]
   await saveBills(documents, fields, {
     identifiers: ['la mutuelle gen']
   })
+
+  // log('info', 'Parsing list of bills')
+  // const documents = await parseBills($)
+
+  // log('info', 'Saving data to Cozy')
+  // await saveBills(documents, fields, {
+  //   identifiers: ['la mutuelle gen']
+  // })
 }
 
-function authenticate(username, password) {
-  return signin({
-    url: `${baseUrl}/EspaceAdherentWebApp/Connexion/Identification?ReturnUrl=%2FEspaceAdherentWebApp%2F`,
-    formSelector: 'form',
-    formData: { Login: username, MotDePasse: password },
-    validate: (statusCode, $, fullResponse) => {
-      if (
-        statusCode === 200 &&
-        fullResponse.request.uri.href === `${baseUrl}/EspaceAdherentWebApp/`
-      ) {
-        return true
-      } else {
-        return false
-      }
+async function authenticate(username, password) {
+  // prepare code_challenge
+  const code_verifier = generateRandom(43)
+  const code_challenge = btoa(
+    crypto
+      .createHash('sha256')
+      .update(code_verifier)
+      .digest('hex')
+  )
+
+  // call to /oidc/authorize
+  const redirect_url = `https://adherent.lamutuellegenerale.fr/&code_challenge=${code_challenge}&code_challenge_method=S256`
+  var response = await request(
+    `${BASE_URL}/oidc/authorize?response_type=code&scope=openid&client_id=${OIDC_CLIENT_ID}&state=Any-state-5s5ze8g85d&redirect_uri=${redirect_url}`,
+    {
+      resolveWithFullResponse: true
+    }
+  )
+  const params = extractParams(response.request.uri.search)
+  const oidcLoginUri = response.request.uri.href
+
+  // call to oidc/login
+  response = await request.post(oidcLoginUri, {
+    form: {
+      sessionID: params['sessionID'],
+      sessionData: '',
+      username: username,
+      password: password,
+      state: 'submit'
+    },
+    transform: body => cheerio.load(body)
+  })
+
+  const [action, inputs] = parseForm(response, 'form', oidcLoginUri)
+
+  response = await request.post({
+    uri: require('url').resolve(oidcLoginUri, action),
+    method: 'POST',
+    form: { ...inputs },
+    transform: (body, response) => [cheerio.load(body), response],
+    headers: {
+      Referer: oidcLoginUri
     }
   })
+
+  code = extractParams(response[1].socket._httpMessage.path)['code']
+
+  log('debug', code, 'code')
+
+  response = request.post(`${BASE_URL}/oidc/token`, {
+    resolveWithFullResponse: true,
+    json: true,
+    form: {
+      grant_type: 'authorization_code',
+      code: code,
+      client_id: OIDC_CLIENT_ID,
+      code_verifier: code_verifier,
+      redirect_uri: 'https://adherent.lamutuellegenerale.fr/'
+    },
+    headers: {
+      'api-key': API_KEY
+    },
+    transform: body => body
+  })
+
+  return response
 }
 
-async function parseBills($) {
-  const bills = []
-  // Only keep interesting lines
-  const lines = Array.from($('.decomptesTable').find('.decomptesRow.general'))
-  let currentPDF = null
+function generateRandom(e = 5) {
+  let t = ''
+  const n = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-'
+  for (let i = 0; i < e; i++)
+    t += n.charAt(Math.floor(Math.random() * n.length))
+  return t
+}
 
-  for (let line of lines) {
-    const $line = $(line)
-    if ($line.hasClass('alt1')) {
-      log('debug', `Found a month summary line, saving pdf link`)
-      // Extract url part between quotes in href
-      currentPDF =
-        baseUrl +
-        $line
-          .find('a')
-          .attr('href')
-          .split(`'`)[1]
-    } else if ($line.hasClass('alt2')) {
-      log('debug', `Found a payment line, getting details and making bill`)
-      const beneficiary = $line
-        .find('.decomptesCell')
-        .eq(0)
-        .text()
-      const date = parseDate(
-        $line
-          .find('.decomptesCell')
-          .eq(1)
-          .text()
-          .match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/)[0]
-      )
-      const isThirdPartyPayer = Boolean(
-        $line
-          .find('.decomptesCell')
-          .eq(1)
-          .text()
-          .match('aux professionnels de santé')
-      )
-      const groupAmount = parseFloat(
-        $line
-          .find('.col-montant-total')
-          .text()
-          .replace('€', '')
-          .replace(',', '.')
-          .replace(/ /g, '')
-          .trim()
-      )
+function atob(str) {
+  return Buffer.from(str, 'base64').toString('binary')
+}
 
-      // Getting more details through an ajax request on website
-      const detailsLink = baseUrl + $line.find('a').attr('href')
-      const $details = await request(detailsLink)
+function btoa(str) {
+  if (str instanceof Buffer) {
+    return str.toString('base64')
+  } else {
+    return Buffer.from(str.toString(), 'binary').toString('base64')
+  }
+}
 
-      // Loop on each bill in details
-      const detailsLines = Array.from($details('.decomptesRow.alt2'))
-      for (let detailsLine of detailsLines) {
-        const $detailsLine = $details(detailsLine)
-        const originalDate = $detailsLine
-          .find('.col-date .decomptesValeur')
-          .text()
-          .trim()
-        const subtype = $detailsLine
-          .find('.col-natprest .decomptesValeur')
-          .text()
-          .trim()
-        const originalAmount = parseFloat(
-          $detailsLine
-            .find('.col-montant')
-            .eq(0)
-            .find('.decomptesValeur')
-            .text()
-            .replace('€', '')
-            .replace(',', '.')
-            .replace(/ /g, '')
-            .trim()
-        )
-        const socialSecurityRefund =
-          parseFloat(
-            $detailsLine
-              .find('.col-montant')
-              .eq(1)
-              .find('.decomptesValeur')
-              .text()
-              .replace('€', '')
-              .replace(',', '.')
-              .trim()
-          ) || 0 //default if no number
-        const amount =
-          parseFloat(
-            $detailsLine
-              .find('.col-montantmutuelle')
-              .find('.decomptesValeur')
-              .text()
-              .replace('€', '')
-              .replace(',', '.')
-              .replace(/ /g, '')
-              .trim()
-          ) || 0 //default if no number
-        const filename =
-          date.getFullYear() +
-          '-' +
-          ('0' + (date.getMonth() + 1)).slice(-2) +
-          '_lamutuellegenerale' +
-          '.pdf'
-        const bill = {
-          fileurl: currentPDF,
-          beneficiary,
-          date: date,
-          isThirdPartyPayer,
-          groupAmount,
-          originalDate: parseDate(originalDate),
-          subtype,
-          originalAmount,
-          socialSecurityRefund,
-          amount,
-          filename,
-          vendor: 'lamutuellegenerale',
-          type: 'health_costs',
-          currency: '€',
-          isRefund: true,
-          metadata: {
-            importDate: new Date(),
-            version: 1
-          }
-        }
-        // Temporary delete current month bills because of unkown pdf management on website
-        if (
-          bill.metadata.importDate.getMonth() === bill.date.getMonth() &&
-          bill.metadata.importDate.getFullYear() === bill.date.getFullYear()
-        ) {
-          log('info', `Forget one bill of the current month`)
-        } else {
-          bills.push(bill)
-        }
+function extractParams(url) {
+  const params = {}
+  url.replace(/[?&]+([^=&]+)=([^&]*)/gi, function(m, key, value) {
+    params[key] = value
+  })
+  return params
+}
+
+function parseForm($, formSelector, currentUrl) {
+  const form = $(formSelector).first()
+  const action = form.attr('action') || currentUrl
+
+  if (!form.is('form')) {
+    const err = 'element matching `' + formSelector + '` is not a `form`'
+    log('error', err)
+    throw new Error('INVALID_FORM')
+  }
+
+  const inputs = {}
+  const arr = form.serializeArray()
+
+  for (let input of arr) {
+    inputs[input.name] = input.value
+  }
+
+  return [action, inputs]
+}
+
+async function getIdentity(token) {
+  const accueilCompte = await request(
+    `${BASE_URL}/espaceadherent/V1/moncompte/accueilCompte`,
+    {
+      json: true,
+      headers: {
+        'api-key': API_KEY,
+        Authorization: `${token.token_type} ${token.access_token}`,
+        idPersonneUtilisateur: token.golden_id,
+        appRequestCode: 'EspaceAdherent'
       }
     }
-  }
-  return bills
-}
-
-async function getIdentity() {
-  const $ = await request(
-    `${baseUrl}/EspaceAdherentWebApp/MonCompte/MesDonneesPersonnelles`
   )
-
-  const identityArray = scrape(
-    $,
+  const infosPersonnelles = await request(
+    `${BASE_URL}/espaceadherent/V1/moncompte/infosPersonnelles`,
     {
-      key: 'label[for]',
-      value: {
-        sel: '.form_input',
-        fn: el => {
-          const $input = $(el).find('input')
-          if ($input.length) {
-            return $input.val().trim()
-          } else
-            return $(el)
-              .text()
-              .trim()
-        }
+      json: true,
+      headers: {
+        'api-key': API_KEY,
+        Authorization: `${token.token_type} ${token.access_token}`,
+        idPersonneUtilisateur: token.golden_id,
+        appRequestCode: 'EspaceAdherent'
       }
-    },
-    '.informations .form_line'
-  )
-  const identity = identityArray.reduce(
-    (memo, doc) => ({ ...memo, [doc.key.replace(':', '').trim()]: doc.value }),
-    {}
+    }
   )
 
   const phone = []
-  if (identity['Téléphone domicile']) {
-    phone.push({
-      type: 'home',
-      number: identity['Téléphone domicile']
-    })
-  }
+  // pas de tel fixe perso donc je n'ai pas la clé dans le json retourné
+  // if (accueilCompte.infosAccueil.infosPerso.telephoneFixe) {
+  //   phone.push({
+  //     type: 'home',
+  //     number: accueilCompte.infosAccueil.infosPerso.telephoneFixe
+  //   })
+  // }
 
-  if (identity['Téléphone portable']) {
+  if (accueilCompte.infosAccueil.infosPerso.telephonePortable) {
     phone.push({
       type: 'mobile',
-      number: identity['Téléphone portable']
+      number: accueilCompte.infosAccueil.infosPerso.telephonePortable
     })
   }
 
-  const emailDoc = identityArray.find(doc => doc.key === '')
-  let email = null
-  if (emailDoc && emailDoc.value && emailDoc.value.includes('@')) {
-    email = [{ address: emailDoc.value }]
-  }
+  let email = [{ address: accueilCompte.infosAccueil.infosPerso.email }]
 
-  let address = {
-    street: identity['Adresse'].replace(/\s+/g, ' '),
-    postcode: identity['Code postal'],
-    city: identity['Ville']
-  }
-  address.formatedAddress = `${address.street} ${address.postcode} ${address.city}`
-  address = [address]
+  let address = [
+    { formatedAddress: accueilCompte.infosAccueil.infosPerso.adresse }
+  ]
 
   const contact = {
     name: {
-      givenName: identity.Prénom,
-      familyName: identity.Nom
+      givenName: infosPersonnelles.informationsPersonnelles.prenom,
+      familyName: infosPersonnelles.informationsPersonnelles.nom
     },
-    socialSecurityNumber: identity['N° de SS'].replace(/\s/g, ''),
-    birthday: identity['Date de naissance']
-      .split('/')
-      .reverse()
-      .join('-'),
+    // socialSecurityNumber: infosPersonnelles.informationsPersonnelles.informationsSS.numeroSS,
+    birthday: infosPersonnelles.informationsPersonnelles.profil.dateNaissance,
     phone,
     address,
     email
   }
 
   return contact
-}
-
-// Convert a french date to Date object
-function parseDate(text) {
-  const [d, m, y] = text.split('/', 3).map(e => parseInt(e, 10))
-  return new Date(y, m - 1, d)
 }
