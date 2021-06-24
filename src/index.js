@@ -5,13 +5,11 @@ process.env.SENTRY_DSN =
 const {
   BaseKonnector,
   requestFactory,
-  signin,
   saveBills,
-  log,
-  scrape
+  log
 } = require('cozy-konnector-libs')
 const request = requestFactory({
-  //  debug: true,
+  // debug: true,
   cheerio: false,
   json: false,
   jar: true
@@ -19,6 +17,7 @@ const request = requestFactory({
 const crypto = require('crypto')
 const stream = require('stream')
 const cheerio = require('cheerio')
+const moment = require('moment')
 
 const BASE_URL = 'https://api.lamutuellegenerale.fr'
 const API_KEY = 'l7xx7e96b9de59df491a8d4c79be999e7c87'
@@ -32,73 +31,12 @@ async function start(fields) {
   token.golden_id = JSON.parse(atob(token.id_token.split('.')[1])).sub[0].id
   log('info', 'Successfully logged in')
   log('debug', token, 'Token')
-  const identity = await getIdentity(token)
-  await this.saveIdentity(identity, fields.login)
 
-  // log('info', 'Fetching the list of refunds')
-  // const $ = await request(`${BASE_URL}/espaceadherent/V1/mesremboursements/`, {
-  //   json: true,
-  //   headers: {
-  //     'api-key': API_KEY,
-  //     Authorization: `${token.token_type} ${token.access_token}`,
-  //     idPersonneUtilisateur: token.golden_id,
-  //     appRequestCode: 'EspaceAdherent'
-  //   }
-  // })
-
-  // log('info', $)
-
-  const bill = {
-    // fileurl: `${BASE_URL}/espaceadherent/V1/mesremboursements/edition?debutPeriode=2021-04-01&finPeriode=2021-04-30&tri=DATE_PAIEMENT&mock=false`,
-    fetchFile: async function(d) {
-      // filestream: async function(d) {
-      log('info', 'Fetching file for id: ' + d.id)
-      // Prepare the store to fetch the next bill
-      return request(
-        `${BASE_URL}/espaceadherent/V1/mesremboursements/edition?debutPeriode=2021-04-01&finPeriode=2021-04-30&tri=DATE_PAIEMENT&mock=false`,
-        {
-          json: true,
-          form: {
-            debutPeriode: '2021-04-01',
-            finPeriode: '2021-04-30',
-            tri: 'DATE_PAIEMENT',
-            mock: 'false'
-          },
-          headers: {
-            'api-key': API_KEY,
-            Authorization: `${token.token_type} ${token.access_token}`,
-            idPersonneUtilisateur: token.golden_id,
-            appRequestCode: 'EspaceAdherent'
-          }
-        }
-      ).then(e => decodePdf(e.edition))
-      // .pipe(new stream.PassThrough())
-    },
-    // beneficiary,
-    date: new Date(),
-    // isThirdPartyPayer,
-    groupAmount: 10,
-    // originalDate: parseDate(originalDate),
-    // subtype,
-    // originalAmount,
-    // socialSecurityRefund,
-    amount: 10,
-    filename: 'test.pdf',
-    vendor: 'lamutuellegenerale',
-    type: 'health_costs',
-    currency: '€',
-    isRefund: true,
-    metadata: {
-      importDate: new Date(),
-      version: 1
-    },
-    requestOptions: {
-      form: {
-        debutPeriode: '2021-04-01',
-        finPeriode: '2021-04-30',
-        tri: 'DATE_PAIEMENT',
-        mock: 'false'
-      },
+  log('info', 'Fetching the list of refunds')
+  const refunds = await request(
+    `${BASE_URL}/espaceadherent/V1/mesremboursements/`,
+    {
+      json: true,
       headers: {
         'api-key': API_KEY,
         Authorization: `${token.token_type} ${token.access_token}`,
@@ -106,20 +44,15 @@ async function start(fields) {
         appRequestCode: 'EspaceAdherent'
       }
     }
-  }
+  )
 
-  const documents = [bill]
+  log('info', 'Parsing list of bills')
+  const documents = await getBillsFromRefunds(refunds, token)
+
+  log('info', documents, 'Saving data to Cozy')
   await saveBills(documents, fields, {
     identifiers: ['la mutuelle gen']
   })
-
-  // log('info', 'Parsing list of bills')
-  // const documents = await parseBills($)
-
-  // log('info', 'Saving data to Cozy')
-  // await saveBills(documents, fields, {
-  //   identifiers: ['la mutuelle gen']
-  // })
 }
 
 async function authenticate(username, password) {
@@ -155,8 +88,10 @@ async function authenticate(username, password) {
     transform: body => cheerio.load(body)
   })
 
+  // parse form
   const [action, inputs] = parseForm(response, 'form', oidcLoginUri)
 
+  // request form
   response = await request.post({
     uri: require('url').resolve(oidcLoginUri, action),
     method: 'POST',
@@ -167,10 +102,11 @@ async function authenticate(username, password) {
     }
   })
 
-  code = extractParams(response[1].socket._httpMessage.path)['code']
-
+  // extract returned code
+  const code = extractParams(response[1].socket._httpMessage.path)['code']
   log('debug', code, 'code')
 
+  // get token from the code
   response = request.post(`${BASE_URL}/oidc/token`, {
     resolveWithFullResponse: true,
     json: true,
@@ -238,69 +174,6 @@ function parseForm($, formSelector, currentUrl) {
   return [action, inputs]
 }
 
-async function getIdentity(token) {
-  const accueilCompte = await request(
-    `${BASE_URL}/espaceadherent/V1/moncompte/accueilCompte`,
-    {
-      json: true,
-      headers: {
-        'api-key': API_KEY,
-        Authorization: `${token.token_type} ${token.access_token}`,
-        idPersonneUtilisateur: token.golden_id,
-        appRequestCode: 'EspaceAdherent'
-      }
-    }
-  )
-  const infosPersonnelles = await request(
-    `${BASE_URL}/espaceadherent/V1/moncompte/infosPersonnelles`,
-    {
-      json: true,
-      headers: {
-        'api-key': API_KEY,
-        Authorization: `${token.token_type} ${token.access_token}`,
-        idPersonneUtilisateur: token.golden_id,
-        appRequestCode: 'EspaceAdherent'
-      }
-    }
-  )
-
-  const phone = []
-  // pas de tel fixe perso donc je n'ai pas la clé dans le json retourné
-  // if (accueilCompte.infosAccueil.infosPerso.telephoneFixe) {
-  //   phone.push({
-  //     type: 'home',
-  //     number: accueilCompte.infosAccueil.infosPerso.telephoneFixe
-  //   })
-  // }
-
-  if (accueilCompte.infosAccueil.infosPerso.telephonePortable) {
-    phone.push({
-      type: 'mobile',
-      number: accueilCompte.infosAccueil.infosPerso.telephonePortable
-    })
-  }
-
-  let email = [{ address: accueilCompte.infosAccueil.infosPerso.email }]
-
-  let address = [
-    { formatedAddress: accueilCompte.infosAccueil.infosPerso.adresse }
-  ]
-
-  const contact = {
-    name: {
-      givenName: infosPersonnelles.informationsPersonnelles.prenom,
-      familyName: infosPersonnelles.informationsPersonnelles.nom
-    },
-    // socialSecurityNumber: infosPersonnelles.informationsPersonnelles.informationsSS.numeroSS,
-    birthday: infosPersonnelles.informationsPersonnelles.profil.dateNaissance,
-    phone,
-    address,
-    email
-  }
-
-  return contact
-}
-
 function decodePdf(encodedPdf) {
   let n = atob(encodedPdf)
   const bufferStream = new stream.PassThrough()
@@ -312,4 +185,94 @@ function decodePdf(encodedPdf) {
     bufferStream.write(s)
   }
   return bufferStream
+}
+
+async function getBillsFromRefunds(refunds, token) {
+  const monthToBills = {}
+
+  for (let refund of refunds.remboursements) {
+    const refundDetail = await request(
+      `${BASE_URL}/espaceadherent/V1/mesremboursements/${refund.id}?mock=false`,
+      {
+        json: true,
+        headers: {
+          'api-key': API_KEY,
+          Authorization: `${token.token_type} ${token.access_token}`,
+          idPersonneUtilisateur: token.golden_id,
+          appRequestCode: 'EspaceAdherent'
+        }
+      }
+    )
+
+    const month = refund.dateVersement.substring(0, 7)
+    var bill = monthToBills[month]
+    if (bill === undefined) {
+      bill = {
+        amount: 0,
+        groupAmount: 0,
+        // originalAmount: 0,
+        thirdPartyRefund: 0,
+        socialSecurityRefund: 0,
+        subType: refundDetail.remboursement.libelleCategoriePrestation
+      }
+      monthToBills[month] = bill
+    }
+    bill.amount += refundDetail.remboursement.coutPrestation
+    bill.socialSecurityRefund += refundDetail.remboursement.montantVerseRO
+    if (refundDetail.remboursement.tiersPayant) {
+      bill.thirdPartyRefund += refundDetail.remboursement.montantVerseLMG
+    } else {
+      bill.groupAmount += refundDetail.remboursement.montantVerseLMG
+    }
+    if (bill.subType !== refundDetail.remboursement.libelleCategoriePrestation)
+      bill.subType = 'Multiple'
+  }
+
+  let bills = []
+  for (let monthKey in monthToBills) {
+    const momentDate = moment(monthKey)
+    let bill = {
+      fetchFile: async function(d) {
+        return request(
+          `${BASE_URL}/espaceadherent/V1/mesremboursements/edition?debutPeriode=${momentDate.format(
+            'YYYY-MM-DD'
+          )}&finPeriode=${momentDate
+            .endOf('month')
+            .format('YYYY-MM-DD')}&tri=DATE_PAIEMENT&mock=false`,
+          {
+            json: true,
+            form: {
+              debutPeriode: '2021-04-01',
+              finPeriode: '2021-04-30',
+              tri: 'DATE_PAIEMENT',
+              mock: 'false'
+            },
+            headers: {
+              'api-key': API_KEY,
+              Authorization: `${token.token_type} ${token.access_token}`,
+              idPersonneUtilisateur: token.golden_id,
+              appRequestCode: 'EspaceAdherent'
+            }
+          }
+        ).then(e => decodePdf(e.edition))
+      },
+      date: new Date(monthKey),
+      isThirdPartyPayer: monthToBills[monthKey].groupAmount == 0,
+      groupAmount: monthToBills[monthKey].groupAmount,
+      subtype: monthToBills[monthKey].subtype,
+      socialSecurityRefund: monthToBills[monthKey].socialSecurityRefund,
+      amount: monthToBills[monthKey].amount,
+      filename: monthKey + '_lamutuellegenerale.pdf',
+      vendor: 'lamutuellegenerale',
+      type: 'health_costs',
+      currency: '€',
+      isRefund: true,
+      metadata: {
+        importDate: new Date(),
+        version: 1
+      }
+    }
+    bills.push(bill)
+  }
+  return bills
 }
