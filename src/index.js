@@ -71,7 +71,7 @@ async function start(fields) {
             appRequestCode: 'EspaceAdherent'
           }
         }
-      ).then(e => Buffer.from(e.edition, 'base64').toString('binary'))
+      ).then(e => decodePdf(e.edition))
       // .pipe(new stream.PassThrough())
     },
     // beneficiary,
@@ -299,4 +299,17 @@ async function getIdentity(token) {
   }
 
   return contact
+}
+
+function decodePdf(encodedPdf) {
+  let n = atob(encodedPdf)
+  const bufferStream = new stream.PassThrough()
+  for (let r = 0; r < n.length; r += 512) {
+    let e = n.slice(r, r + 512)
+    let t = new Array(e.length)
+    for (let n = 0; n < e.length; n++) t[n] = e.charCodeAt(n)
+    let s = new Uint8Array(t)
+    bufferStream.write(s)
+  }
+  return bufferStream
 }
